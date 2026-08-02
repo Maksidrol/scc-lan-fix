@@ -1,0 +1,5 @@
+LIBRARY systemdetection.dll
+
+EXPORTS
+    GetHardwareInstance     @1
+    GetScoreInstance        @2
