@@ -7,12 +7,12 @@
 
 CC = i686-w64-mingw32-gcc
 
-wsock32.dll: wsock32.c wsock32.def
+systemdetection.dll: wsock32.c wsock32.def
 	$(CC) -m32 -shared -O2 \
-		-o wsock32.dll \
+		-o systemdetection.dll \
 		wsock32.c wsock32.def \
-		-lws2_32 -liphlpapi \
+		-lws2_32 -liphlpapi -lwinmm \
 		-Wall -Wno-unused-parameter
 
 clean:
-	rm -f wsock32.dll
+	rm -f systemdetection.dll

@@ -39,7 +39,8 @@ echo [2/2] Linking systemdetection.dll ...
   "%WK%\Lib\%WK_VER%\ucrt\x86\libucrt.lib" ^
   "%WK%\Lib\%WK_VER%\um\x86\ws2_32.lib" ^
   "%WK%\Lib\%WK_VER%\um\x86\iphlpapi.lib" ^
-  "%WK%\Lib\%WK_VER%\um\x86\kernel32.lib"
+  "%WK%\Lib\%WK_VER%\um\x86\kernel32.lib" ^
+  "%WK%\Lib\%WK_VER%\um\x86\winmm.lib"
 
 if errorlevel 1 (
     echo FAILED: link step
