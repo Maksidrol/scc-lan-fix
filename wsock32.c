@@ -4,10 +4,10 @@
  * Drop next to conviction_game.exe. Works on Windows and Linux/Steam Deck.
  *
  * On load:
- *   1. Starts an internal TCP server on 127.0.0.1:3074 that serves
+ *   1. Lazily starts an internal TCP server on a private loopback port that serves
  *      a fake Ubisoft matchmaking XML response (same as bypass_server_check.py)
  *   2. Patches the game's Import Address Table so:
- *      - connect() to port 3074 is redirected to 127.0.0.1:3074
+ *      - connect() to port 3074 is redirected to the private loopback server
  *      - bind() tracks UDP sockets bound to port 46000
  *      - recvfrom()/WSARecvFrom() fix host IP in LAN session info packets
  *        (same logic as fix_lan_packet.py)
@@ -49,9 +49,16 @@ static void log_init(void) {
 }
 
 static void dbg(const char *fmt, ...) {
-    if (!g_log) return;
+    /* stdio is allowed to overwrite the calling thread's Winsock last error.
+     * Hooks must be observational: diagnostics cannot change game behaviour. */
+    int saved_wsa_error = WSAGetLastError();
+    if (!g_log) {
+        WSASetLastError(saved_wsa_error);
+        return;
+    }
     va_list ap; va_start(ap, fmt); vfprintf(g_log, fmt, ap); va_end(ap);
     fprintf(g_log, "\n");
+    WSASetLastError(saved_wsa_error);
 }
 
 #define DBG(...) dbg(__VA_ARGS__)
@@ -166,41 +173,104 @@ static const char matchmaking_response[] =
 #define MATCHMAKING_RESPONSE_LEN ((int)(sizeof(matchmaking_response) - 1))
 
 /* ------------------------------------------------------------------ */
-/* Internal TCP server on 127.0.0.1:3074 — serves fake Ubisoft XML   */
+/* Internal TCP server on private loopback port — serves fake Ubisoft XML */
 /* ------------------------------------------------------------------ */
 
 /* Saved before patch_iat — used by server thread and detach cleanup */
 static int (WINAPI *orig_closesocket)(SOCKET) = NULL;
 
 static SOCKET g_server_sock = INVALID_SOCKET;
+static HANDLE g_server_ready_event = NULL;
+static volatile LONG g_server_port = 0;
+static HMODULE g_self_module = NULL;
+static SOCKET g_last_redirect_socket = INVALID_SOCKET;
+static DWORD  g_last_redirect_tick = 0;
+
+enum {
+    SERVER_NOT_STARTED = 0,
+    SERVER_STARTING    = 1,
+    SERVER_READY       = 2,
+    SERVER_FAILED   = -1
+};
+
+static volatile LONG g_server_state = SERVER_NOT_STARTED;
+
+static void set_server_state(LONG state) {
+    InterlockedExchange(&g_server_state, state);
+    if (g_server_ready_event)
+        SetEvent(g_server_ready_event);
+}
 
 static DWORD WINAPI tcp_server_thread(LPVOID unused) {
     (void)unused;
 
-    SOCKET srv = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
-    if (srv == INVALID_SOCKET) { DBG("server: socket() failed"); return 1; }
+    /* Keep a Winsock reference owned by this DLL. The game may balance its
+     * own WSAStartup with WSACleanup before the LAN menu is opened; without
+     * this reference that cleanup can invalidate our listener. */
+    WSADATA wsa;
+    int wsa_result = WSAStartup(MAKEWORD(2, 2), &wsa);
+    if (wsa_result != 0) {
+        DBG("server: WSAStartup failed (%d)", wsa_result);
+        set_server_state(SERVER_FAILED);
+        return 1;
+    }
 
-    BOOL reuse = TRUE;
-    setsockopt(srv, SOL_SOCKET, SO_REUSEADDR, (const char *)&reuse, sizeof(reuse));
+    SOCKET srv = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
+    if (srv == INVALID_SOCKET) {
+        DBG("server: socket() failed (%d)", WSAGetLastError());
+        set_server_state(SERVER_FAILED);
+        WSACleanup();
+        return 1;
+    }
 
     struct sockaddr_in addr;
     addr.sin_family      = AF_INET;
     addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
-    addr.sin_port        = htons(3074);
+    /* Let Windows select a private per-process port. Port 3074 can remain
+     * owned briefly by SCC's bootstrap process even after that PID vanishes. */
+    addr.sin_port        = 0;
 
     if (real_bind(srv, (struct sockaddr *)&addr, sizeof(addr)) != 0) {
-        DBG("server: bind() failed on 127.0.0.1:3074");
+        DBG("server: bind() failed on private loopback port (%d)", WSAGetLastError());
         orig_closesocket(srv);
+        set_server_state(SERVER_FAILED);
+        WSACleanup();
         return 1;
     }
-    listen(srv, 10);
+    if (listen(srv, 10) != 0) {
+        DBG("server: listen() failed on private loopback port (%d)", WSAGetLastError());
+        orig_closesocket(srv);
+        set_server_state(SERVER_FAILED);
+        WSACleanup();
+        return 1;
+    }
+
+    {
+        int addr_len = sizeof(addr);
+        if (getsockname(srv, (struct sockaddr *)&addr, &addr_len) != 0 ||
+            ntohs(addr.sin_port) == 0) {
+            DBG("server: getsockname() failed (%d)", WSAGetLastError());
+            orig_closesocket(srv);
+            set_server_state(SERVER_FAILED);
+            WSACleanup();
+            return 1;
+        }
+        InterlockedExchange(&g_server_port, (LONG)ntohs(addr.sin_port));
+    }
+
     g_server_sock = srv;
-    DBG("server: listening on 127.0.0.1:3074");
+    set_server_state(SERVER_READY);
+    DBG("server: listening on 127.0.0.1:%ld (pid=%lu tid=%lu socket=%lu)",
+        InterlockedCompareExchange(&g_server_port, 0, 0),
+        GetCurrentProcessId(), GetCurrentThreadId(), (unsigned long)srv);
 
     while (1) {
         SOCKET client = accept(srv, NULL, NULL);
-        if (client == INVALID_SOCKET) break;
-        DBG("server: accepted connection");
+        if (client == INVALID_SOCKET) {
+            DBG("server: accept() stopped (%d)", WSAGetLastError());
+            break;
+        }
+        DBG("server: accepted connection (socket=%lu)", (unsigned long)client);
 
         /* 3-second timeouts — prevents hanging if game opens socket but sends/reads nothing */
         DWORD tv = 3000;
@@ -231,13 +301,53 @@ static DWORD WINAPI tcp_server_thread(LPVOID unused) {
         orig_closesocket(client);
         DBG("server: sent fake response and closed client");
     }
+
+    g_server_sock = INVALID_SOCKET;
+    InterlockedExchange(&g_server_port, 0);
+    set_server_state(SERVER_FAILED);
+    WSACleanup();
+    DBG("server: stopped");
     return 0;
 }
 
 static void start_tcp_server(void) {
     HANDLE t = CreateThread(NULL, 0, tcp_server_thread, NULL, 0, NULL);
     if (t) { CloseHandle(t); }
-    else { DBG("ERROR: CreateThread for tcp_server_thread failed (%lu)", GetLastError()); }
+    else {
+        DBG("ERROR: CreateThread for tcp_server_thread failed (%lu)", GetLastError());
+        set_server_state(SERVER_FAILED);
+    }
+}
+
+/* SCC starts a short-lived bootstrap process before the real game process.
+ * Starting the listener from DllMain lets that bootstrap process keep 3074
+ * occupied while the real process is loading. Start it only when this process
+ * actually makes the GameConnect request. The CAS also makes simultaneous
+ * non-blocking connect attempts share one listener and one ready event. */
+static void ensure_tcp_server_started(void) {
+    LONG previous = InterlockedCompareExchange(
+        &g_server_state, SERVER_STARTING, SERVER_NOT_STARTED);
+
+    if (previous == SERVER_NOT_STARTED) {
+        DBG("server: lazy start requested (pid=%lu tid=%lu)",
+            GetCurrentProcessId(), GetCurrentThreadId());
+
+        /* The accept worker executes code from this DLL for the rest of the
+         * process lifetime. Pin only now: bootstrap processes that never use
+         * LAN can still unload the DLL normally and never create a worker. */
+        {
+            HMODULE pinned = NULL;
+            if (!g_self_module ||
+                !GetModuleHandleExA(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS |
+                                    GET_MODULE_HANDLE_EX_FLAG_PIN,
+                                    (LPCSTR)g_self_module, &pinned)) {
+                DBG("server: failed to pin DLL (%lu)", GetLastError());
+                set_server_state(SERVER_FAILED);
+                return;
+            }
+        }
+        start_tcp_server();
+    }
 }
 
 /* ------------------------------------------------------------------ */
@@ -403,14 +513,76 @@ static int WINAPI my_connect(SOCKET s, const struct sockaddr *name, int namelen)
         const struct sockaddr_in *addr = (const struct sockaddr_in *)name;
         int port = ntohs(addr->sin_port);
         if (port == 3074) {
+            /* The bootstrap process never reaches this endpoint, so it never
+             * owns 3074. In the real process wait until bind/listen is ready. */
+            ensure_tcp_server_started();
+            DWORD wait_result = g_server_ready_event
+                ? WaitForSingleObject(g_server_ready_event, 5000)
+                : WAIT_FAILED;
+            LONG server_state = InterlockedCompareExchange(&g_server_state, 0, 0);
+
+            if (wait_result != WAIT_OBJECT_0 || server_state != SERVER_READY) {
+                int error = (wait_result == WAIT_TIMEOUT) ? WSAETIMEDOUT : WSAECONNREFUSED;
+                DBG("connect: local server unavailable (wait=%lu state=%ld error=%d)",
+                    wait_result, server_state, error);
+                WSASetLastError(error);
+                return SOCKET_ERROR;
+            }
+
+            LONG local_server_port = InterlockedCompareExchange(&g_server_port, 0, 0);
+            if (local_server_port <= 0 || local_server_port > 65535) {
+                DBG("connect: local server published invalid port (%ld)", local_server_port);
+                WSASetLastError(WSAECONNREFUSED);
+                return SOCKET_ERROR;
+            }
+
+            struct sockaddr_in bound;
+            int bound_len = sizeof(bound);
+            int socket_type = 0;
+            int type_len = sizeof(socket_type);
+            memset(&bound, 0, sizeof(bound));
+            getsockname(s, (struct sockaddr *)&bound, &bound_len);
+            getsockopt(s, SOL_SOCKET, SO_TYPE, (char *)&socket_type, &type_len);
+
+            {
+                DWORD src = ntohl(bound.sin_addr.s_addr);
+                DWORD dst = ntohl(addr->sin_addr.s_addr);
+                DBG("connect: socket=%lu type=%d local=%lu.%lu.%lu.%lu:%u original=%lu.%lu.%lu.%lu:3074",
+                    (unsigned long)s, socket_type,
+                    (src >> 24) & 0xff, (src >> 16) & 0xff,
+                    (src >> 8) & 0xff, src & 0xff, ntohs(bound.sin_port),
+                    (dst >> 24) & 0xff, (dst >> 16) & 0xff,
+                    (dst >> 8) & 0xff, dst & 0xff);
+            }
+
             struct sockaddr_in local;
+            memset(&local, 0, sizeof(local));
             local.sin_family      = AF_INET;
             local.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
-            local.sin_port        = htons(3074);
+            local.sin_port        = htons((u_short)local_server_port);
             /* TCP_NODELAY: disable Nagle on loopback — no real RTT, only adds latency */
             BOOL nodelay = TRUE;
             setsockopt(s, IPPROTO_TCP, TCP_NODELAY, (const char *)&nodelay, sizeof(nodelay));
+            g_last_redirect_socket = s;
+            g_last_redirect_tick = GetTickCount();
             int r = real_connect(s, (struct sockaddr *)&local, sizeof(local));
+            int error = (r == SOCKET_ERROR) ? WSAGetLastError() : 0;
+            if (r == 0) {
+                DBG("connect: redirected port 3074 to 127.0.0.1:%ld",
+                    local_server_port);
+            } else {
+                if (error == WSAEWOULDBLOCK || error == WSAEINPROGRESS ||
+                    error == WSAEALREADY)
+                    DBG("connect: redirect pending (%d)", error);
+                else
+                    DBG("connect: redirect failed (%d)", error);
+            }
+
+            /* DBG/stdio and other Win32 calls may overwrite the thread's last
+             * error. The game checks WSAGetLastError after non-blocking
+             * connect(), so restore the exact result from real_connect. */
+            if (r == SOCKET_ERROR)
+                WSASetLastError(error);
             return r;
         }
     }
@@ -505,8 +677,23 @@ static int WINAPI my_recvfrom(SOCKET s, char *buf, int len, int flags,
 }
 
 static int WINAPI my_closesocket(SOCKET s) {
+    int was_redirected = (s == g_last_redirect_socket);
+    DWORD redirect_lifetime = was_redirected
+        ? GetTickCount() - g_last_redirect_tick
+        : 0;
+
     udp46_remove(s);
-    return real_closesocket(s);
+    int result = real_closesocket(s);
+    int error = WSAGetLastError();
+
+    if (was_redirected) {
+        g_last_redirect_socket = INVALID_SOCKET;
+        DBG("connect: redirected socket closed after %lu ms (result=%d error=%d)",
+            redirect_lifetime, result, error);
+        WSASetLastError(error);
+    }
+
+    return result;
 }
 
 /* Precision sleep: coarse Sleep() + spin-wait on last 2 ms.
@@ -858,6 +1045,13 @@ static void apply_exe_patches(void) {
     BYTE *base = (BYTE *)GetModuleHandleA(NULL);
     if (!base) return;
 
+    /* The DLL can also be loaded by launch/bootstrap helpers. Never probe a
+     * game-specific RVA unless it is inside this process's executable image. */
+    IMAGE_DOS_HEADER *dos = (IMAGE_DOS_HEADER *)base;
+    if (dos->e_magic != IMAGE_DOS_SIGNATURE) return;
+    IMAGE_NT_HEADERS *nt = (IMAGE_NT_HEADERS *)(base + dos->e_lfanew);
+    if (nt->Signature != IMAGE_NT_SIGNATURE) return;
+
     /* ---- Patch 1: NULL sub-object crash at RVA 0x7C41AA ----
      *
      * Function at 0x00BC4170 checks this->field_4:
@@ -872,8 +1066,15 @@ static void apply_exe_patches(void) {
      * Fix: trampoline that returns 0 when field_24h == NULL.
      */
     {
-        BYTE *patch    = base + (0x00BC41AA - 0x00400000);
+        SIZE_T patch_rva = 0x00BC41AA - 0x00400000;
+        BYTE *patch;
         BYTE  expected[] = { 0x8B, 0x4F, 0x24, 0x8B, 0x11 }; /* MOV ECX,[EDI+24h]; MOV EDX,[ECX] */
+
+        if (patch_rva + sizeof(expected) > nt->OptionalHeader.SizeOfImage) {
+            DBG("exe_patch1: target RVA outside executable image, skipping");
+            return;
+        }
+        patch = base + patch_rva;
 
         if (memcmp(patch, expected, 5) != 0) {
             DBG("exe_patch1: bytes at +7C41AA don't match — wrong exe version, skipping");
@@ -1069,17 +1270,17 @@ __declspec(dllexport) void *WINAPI GetScoreInstance(void)    { return NULL; }
 /* ------------------------------------------------------------------ */
 
 BOOL WINAPI DllMain(HINSTANCE hinstDLL, DWORD fdwReason, LPVOID lpvReserved) {
-    (void)hinstDLL; (void)lpvReserved;
-
     if (fdwReason == DLL_PROCESS_ATTACH) {
+        g_self_module = hinstDLL;
         log_init();
         DBG("=== systemdetection.dll loaded ===");
         timeBeginPeriod(1);
         InitializeCriticalSection(&udp46_lock);
         udp46_socket_count = 0;
 
-        /* Load ws2_32 so real_* pointers are valid fallbacks before patch */
-        real_ws2 = LoadLibraryA("ws2_32.dll");
+        /* ws2_32 is already a static dependency of this DLL. Reuse its loaded
+         * module instead of changing loader reference counts from DllMain. */
+        real_ws2 = GetModuleHandleA("ws2_32.dll");
         if (!real_ws2) { DBG("ERROR: ws2_32.dll not found"); return FALSE; }
 
         /* Set real_* to originals from ws2_32 as safe defaults */
@@ -1099,6 +1300,14 @@ BOOL WINAPI DllMain(HINSTANCE hinstDLL, DWORD fdwReason, LPVOID lpvReserved) {
         DBG("real_connect=%p real_bind=%p real_recvfrom=%p",
             (void*)real_connect, (void*)real_bind, (void*)real_recvfrom);
 
+        /* Created in DllMain, but no server thread or socket is started here.
+         * The short-lived bootstrap process therefore cannot occupy 3074. */
+        g_server_ready_event = CreateEventA(NULL, TRUE, FALSE, NULL);
+        if (!g_server_ready_event) {
+            DBG("ERROR: CreateEvent for TCP server failed (%lu)", GetLastError());
+            InterlockedExchange(&g_server_state, SERVER_FAILED);
+        }
+
         /* Resolve kernel32 functions — needed as fallback even if IAT hook not found */
         HMODULE k32 = GetModuleHandleA("kernel32.dll");
         if (k32) {
@@ -1109,9 +1318,6 @@ BOOL WINAPI DllMain(HINSTANCE hinstDLL, DWORD fdwReason, LPVOID lpvReserved) {
             DBG("real_SetProcessAffinityMask=%p real_Sleep=%p real_SleepEx=%p",
                 (void*)real_SetProcessAffinityMask, (void*)real_Sleep, (void*)real_SleepEx);
         }
-
-        /* Start internal TCP server on 127.0.0.1:3074 */
-        start_tcp_server();
 
         /* Patch the game's IAT */
         DBG("calling patch_iat...");
@@ -1166,14 +1372,24 @@ BOOL WINAPI DllMain(HINSTANCE hinstDLL, DWORD fdwReason, LPVOID lpvReserved) {
         install_crash_handler();
 
     } else if (fdwReason == DLL_PROCESS_DETACH) {
+        /* On process termination Windows has already stopped other threads
+         * and will reclaim handles/sockets. Avoid touching worker-owned state.
+         * lpvReserved==NULL is the safe explicit-unload path; a process that
+         * started the server is pinned and cannot reach it via FreeLibrary. */
+        if (lpvReserved != NULL)
+            return TRUE;
+
         DBG("=== systemdetection.dll unloading ===");
         timeEndPeriod(1);
-        if (g_server_sock != INVALID_SOCKET) {
+        if (g_server_sock != INVALID_SOCKET && orig_closesocket) {
             orig_closesocket(g_server_sock);
             g_server_sock = INVALID_SOCKET;
         }
+        if (g_server_ready_event) {
+            CloseHandle(g_server_ready_event);
+            g_server_ready_event = NULL;
+        }
         DeleteCriticalSection(&udp46_lock);
-        if (real_ws2) FreeLibrary(real_ws2);
         if (g_log) { fclose(g_log); g_log = NULL; }
     }
 

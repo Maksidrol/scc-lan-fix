@@ -8,7 +8,7 @@ Just drop one DLL next to the game.
 
 | Component | Result |
 |---|---|
-| Local matchmaking server (127.0.0.1:3074) | Game works without Ubisoft servers |
+| Lazy per-process matchmaking server (private loopback port) | Game works without Ubisoft servers and avoids launcher port conflicts |
 | connect() redirect to localhost | LAN sessions work |
 | recvfrom/WSARecvFrom IP patch | Other players are visible in LAN lobby |
 | SO_RCVBUF 256KB (ports 46000, 9103) | No packet loss under CPU load |
