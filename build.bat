@@ -14,7 +14,7 @@ set HERE=%~dp0
 
 echo [1/2] Compiling wsock32.c ...
 
-"%MSVC%\bin\Hostx64\x86\cl.exe" /c /MT /O2 ^
+"%MSVC%\bin\Hostx64\x86\cl.exe" /c /MT /O2 /utf-8 ^
   "/I%MSVC%\include" ^
   "/I%WK%\Include\%WK_VER%\um" ^
   "/I%WK%\Include\%WK_VER%\shared" ^
