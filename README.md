@@ -17,6 +17,7 @@ Just drop one DLL next to the game.
 | ABOVE_NORMAL process priority | Stable performance on low-end systems and Steam Deck |
 | EcoQoS / Power Throttling disabled | Windows 11 does not throttle the game in the background |
 | NULL pointer crash fix | No crash during game state transitions |
+| Forced D3DX reference math (co-op) | No co-op desync between different CPUs (Intel/AMD) |
 | Uplay bypass | Game runs without connecting to Ubisoft |
 | Achievement crash fix | No crash when unlocking achievements |
 | Skip intro videos | Launches directly to menu without logo screens |

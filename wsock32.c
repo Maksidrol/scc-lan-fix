@@ -140,6 +140,7 @@ static int    (WINAPI *real_WSARecvFrom)(SOCKET, LPWSABUF, DWORD, LPDWORD, LPDWO
 static BOOL   (WINAPI *real_SetProcessAffinityMask)(HANDLE, DWORD_PTR)                  = NULL;
 static void   (WINAPI *real_Sleep)(DWORD)                                               = NULL;
 static DWORD  (WINAPI *real_SleepEx)(DWORD, BOOL)                                      = NULL;
+static void   (WINAPI *real_D3DXCpuOptimizations)(BOOL)                                 = NULL;
 
 /* ------------------------------------------------------------------ */
 /* Fake Ubisoft matchmaking response                                   */
@@ -1131,6 +1132,25 @@ static void apply_exe_patches(void) {
 /* IAT patch — replaces function pointers in the game's import table  */
 /* ------------------------------------------------------------------ */
 
+/* D3DXCpuOptimizations — force OFF for cross-CPU-vendor determinism.
+ *
+ * conviction_game.exe imports D3DXVec3Normalize / D3DXVec3TransformCoord /
+ * D3DXVec3TransformNormal and calls D3DXCpuOptimizations. With CPU
+ * optimizations enabled, D3DX picks vendor-specific SSE/3DNow code paths whose
+ * fast reciprocal-sqrt differs bit-for-bit between Intel and AMD. In the
+ * deterministic co-op simulation that divergence compounds through the
+ * position-integration feedback loop and desyncs the moment a player walks
+ * (instantaneous actions — aim/shoot/crouch — don't accumulate, so they don't
+ * trip it). Forcing FALSE makes both machines use the identical reference C
+ * path regardless of CPU. Harmless otherwise: slightly slower helper math. */
+static void WINAPI my_D3DXCpuOptimizations(BOOL enable) {
+    (void)enable;
+    if (real_D3DXCpuOptimizations) {
+        real_D3DXCpuOptimizations(FALSE);
+        DBG("d3dx: forced D3DXCpuOptimizations(FALSE) (game requested %d)", enable);
+    }
+}
+
 typedef struct {
     const char *name;
     WORD        ordinal; /* ws2_32.dll ordinal (0 = not imported by ordinal) */
@@ -1153,6 +1173,11 @@ static Hook hooks_kernel32[] = {
     { "SleepEx",                0, my_SleepEx,                (void **)&real_SleepEx                },
 };
 #define NUM_HOOKS_KERNEL32 (sizeof(hooks_kernel32) / sizeof(hooks_kernel32[0]))
+
+static Hook hooks_d3dx10[] = {
+    { "D3DXCpuOptimizations", 0, my_D3DXCpuOptimizations, (void **)&real_D3DXCpuOptimizations },
+};
+#define NUM_HOOKS_D3DX10 (sizeof(hooks_d3dx10) / sizeof(hooks_d3dx10[0]))
 
 static void patch_module_iat(BYTE *base) {
     IMAGE_DOS_HEADER     *dos = (IMAGE_DOS_HEADER *)base;
@@ -1181,6 +1206,9 @@ static void patch_module_iat(BYTE *base) {
         } else if (_stricmp(dll_name, "kernel32.dll") == 0) {
             hook_table = hooks_kernel32;
             hook_count = (int)NUM_HOOKS_KERNEL32;
+        } else if (_stricmp(dll_name, "d3dx10_41.dll") == 0) {
+            hook_table = hooks_d3dx10;
+            hook_count = (int)NUM_HOOKS_D3DX10;
         } else {
             continue;
         }
@@ -1324,6 +1352,25 @@ BOOL WINAPI DllMain(HINSTANCE hinstDLL, DWORD fdwReason, LPVOID lpvReserved) {
         patch_iat();
         DBG("patch_iat done");
         DBG("hooks patched: connect bind recvfrom closesocket WSARecvFrom SetProcessAffinityMask Sleep");
+
+        /* Force D3DX onto the vendor-neutral reference math path for co-op
+         * determinism. The IAT hook already catches the game's own call, but if
+         * d3dx10_41.dll is already loaded, assert it now too (covers the case
+         * where the game relies on the default, which is optimizations ON). */
+        {
+            HMODULE d3dx = GetModuleHandleA("d3dx10_41.dll");
+            if (d3dx) {
+                if (!real_D3DXCpuOptimizations)
+                    real_D3DXCpuOptimizations =
+                        (void (WINAPI *)(BOOL))GetProcAddress(d3dx, "D3DXCpuOptimizations");
+                if (real_D3DXCpuOptimizations) {
+                    real_D3DXCpuOptimizations(FALSE);
+                    DBG("d3dx: D3DXCpuOptimizations(FALSE) asserted at load");
+                }
+            } else {
+                DBG("d3dx: d3dx10_41.dll not yet loaded — relying on IAT hook");
+            }
+        }
 
         /* Patch known crash sites directly in exe memory */
         apply_exe_patches();
