@@ -897,10 +897,100 @@ static void mem_nop(void *dst, SIZE_T n) {
 }
 
 /* ------------------------------------------------------------------ */
+/* FusionFix detection                                                */
+/*                                                                    */
+/* FusionFix applies several of the same patches we do (uplay bypass, */
+/* achievement crash fix, skip intro, X360 controller, DLC unlock).   */
+/* Patching the same code twice crashes the game (notably the         */
+/* SteamStub-packed Steam build), so when FusionFix is present we skip */
+/* those duplicates and keep only our unique networking/stability      */
+/* fixes. Detection is by FusionFix's plugin files next to the exe,    */
+/* not by module name (which can be renamed) or byte-signature (its    */
+/* patches may apply after ours).                                      */
+/* ------------------------------------------------------------------ */
+
+static int file_exists_next_to_exe(const char *name) {
+    char path[MAX_PATH];
+    if (!GetModuleFileNameA(NULL, path, MAX_PATH)) return 0;
+    char *slash = strrchr(path, '\\');
+    if (!slash) return 0;
+    *(slash + 1) = '\0';
+    if (strlen(path) + strlen(name) >= MAX_PATH) return 0;
+    strcat(path, name);
+    return GetFileAttributesA(path) != INVALID_FILE_ATTRIBUTES;
+}
+
+static int fusionfix_present(void) {
+    static int cached = -1;
+    if (cached != -1) return cached;
+
+    /* FusionFix's plugin lives in the scripts\ subfolder next to the exe,
+     * loaded by an ASI loader (version.dll/dinput8.dll). Check the plugin
+     * files themselves — the ASI loader is generic and other mods use it too. */
+    const char *files[] = {
+        "scripts\\SplinterCellConviction.FusionFix.asi",
+        "scripts\\SplinterCellConviction.FusionFix.ini",
+    };
+    cached = 0;
+    for (size_t i = 0; i < sizeof(files) / sizeof(files[0]); i++) {
+        if (file_exists_next_to_exe(files[i])) {
+            DBG("fusionfix: detected via file '%s' — skipping duplicate patches",
+                files[i]);
+            cached = 1;
+            return cached;
+        }
+    }
+    /* Also catch its loaded module if the ASI is already mapped. */
+    if (GetModuleHandleA("SplinterCellConviction.FusionFix.asi")) {
+        DBG("fusionfix: detected via loaded FusionFix.asi — skipping duplicate patches");
+        cached = 1;
+        return cached;
+    }
+    DBG("fusionfix: not detected — applying all game patches");
+    return cached;
+}
+
+/* Does FusionFix own the LAN fix? True when FusionFix is installed AND its
+ * FixLAN option is on (default 1). In that case we yield the networking to it:
+ * we do NOT install our ws2_32 hooks or start our matchmaking server, so LAN
+ * traffic passes through to FusionFix untouched and the two don't fight over
+ * the same packets/port. If the user sets FixLAN=0 in FusionFix's ini, our
+ * network fix takes over instead. */
+static int fusionfix_owns_lan(void) {
+    static int cached = -1;
+    if (cached != -1) return cached;
+
+    if (!fusionfix_present()) { cached = 0; return cached; }
+
+    /* Read FixLAN from scripts\SplinterCellConviction.FusionFix.ini next to exe. */
+    char ini[MAX_PATH];
+    if (!GetModuleFileNameA(NULL, ini, MAX_PATH)) { cached = 1; return cached; }
+    char *slash = strrchr(ini, '\\');
+    if (!slash) { cached = 1; return cached; }
+    *(slash + 1) = '\0';
+    const char *rel = "scripts\\SplinterCellConviction.FusionFix.ini";
+    if (strlen(ini) + strlen(rel) >= MAX_PATH) { cached = 1; return cached; }
+    strcat(ini, rel);
+
+    /* Default 1 matches FusionFix's own default when the key is absent. */
+    int fixlan = GetPrivateProfileIntA("LAN", "FixLAN", 1, ini);
+    cached = (fixlan != 0);
+    DBG("fusionfix: FixLAN=%d -> %s LAN", fixlan,
+        cached ? "yielding (FusionFix owns)" : "we own");
+    return cached;
+}
+
+/* ------------------------------------------------------------------ */
 /* Game patches — exe in-memory byte patches                          */
 /* ------------------------------------------------------------------ */
 
 static void apply_game_patches(void) {
+    /* Patches below (uplay, achievement, skip intro, X360, DLC) overlap
+     * with FusionFix. If it's loaded, skip them to avoid double-patching
+     * the same code (which crashes the game). Our networking + stability
+     * fixes live elsewhere and always apply. */
+    int skip_dupes = fusionfix_present();
+
     BYTE *base = (BYTE *)GetModuleHandleA(NULL);
     if (!base) return;
 
@@ -910,6 +1000,11 @@ static void apply_game_patches(void) {
     IMAGE_NT_HEADERS *nt = (IMAGE_NT_HEADERS *)(base + dos->e_lfanew);
     if (nt->Signature != IMAGE_NT_SIGNATURE) return;
     SIZE_T img_size = nt->OptionalHeader.SizeOfImage;
+
+    if (skip_dupes) {
+        DBG("game_patch: FusionFix present — skipping uplay/achievement/intro/X360/DLC patches");
+        return;
+    }
 
     /* ---- Patch: Disable Uplay connection requirement ----
      * JZ -> JMP: skips Uplay initialization block.
@@ -1201,6 +1296,12 @@ static void patch_module_iat(BYTE *base) {
 
         if (_stricmp(dll_name, "ws2_32.dll")  == 0 ||
             _stricmp(dll_name, "wsock32.dll") == 0) {
+            /* Yield networking to FusionFix if it owns the LAN fix — don't
+             * hook the socket functions at all, so traffic passes through. */
+            if (fusionfix_owns_lan()) {
+                DBG("patch_module_iat: FusionFix owns LAN — skipping ws2_32 hooks");
+                continue;
+            }
             hook_table = hooks_ws2;
             hook_count = (int)NUM_HOOKS_WS2;
         } else if (_stricmp(dll_name, "kernel32.dll") == 0) {
@@ -1247,6 +1348,16 @@ static void patch_module_iat(BYTE *base) {
             for (int i = 0; i < hook_count; i++) {
                 if (_stricmp((char *)by_name->Name, hook_table[i].name) != 0)
                     continue;
+
+                /* FusionFix also forces CPU affinity to all cores. If it's
+                 * present, skip our SetProcessAffinityMask hook to avoid two
+                 * mods hooking the same function (Sleep/SleepEx are ours only
+                 * and stay hooked). */
+                if (_stricmp(hook_table[i].name, "SetProcessAffinityMask") == 0 &&
+                    fusionfix_present()) {
+                    DBG("  SKIPPED: SetProcessAffinityMask (FusionFix owns affinity)");
+                    continue;
+                }
 
                 if (*hook_table[i].original == NULL)
                     *hook_table[i].original = (void *)iat_thunk->u1.Function;

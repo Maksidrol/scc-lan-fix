@@ -30,6 +30,17 @@ Just drop one DLL next to the game.
 1. Copy `systemdetection.dll` next to `conviction_game.exe`
 2. Launch the game — LAN multiplayer works, stability improvements and game patches apply automatically
 
+## Using with FusionFix
+
+Compatible with ThirteenAG's FusionFix — both can run together. The DLL
+auto-detects FusionFix and skips their overlapping patches (double-patching
+otherwise crashes the Steam build).
+
+Set `FixLAN = 0` in `SplinterCellConviction.FusionFix.ini` to let this DLL handle
+LAN (recommended — it has the Intel/AMD co-op desync fix). Keep FusionFix for
+features this DLL doesn't cover (ultrawide, windowed mode, co-op FPS uncap, visual
+tweaks).
+
 ## Steam Deck / Linux
 
 Works out of the box via Proton.
