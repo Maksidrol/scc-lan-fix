@@ -68,6 +68,23 @@ LAN sessions are local network only. To play with someone in another location us
 - [Tailscale](https://tailscale.com) — free, easiest setup, works on Steam Deck
 - [Radmin VPN](https://www.radmin-vpn.com) — free, Windows only
 
+## FPS cap
+
+The game's network sync is tied to framerate — patching it directly causes crashes. The correct way to set a cap is via the settings file:
+
+```
+C:\ProgramData\Ubisoft\Conviction\ConvictionUserPC.ini
+```
+
+Under `[Engine.Display]`, change `MaxFPS` to the value you want. For example:
+
+```ini
+[Engine.Display]
+MaxFPS=60
+```
+
+If your PC struggles in co-op, `MaxFPS=30` helps. The cap applies to the entire game, including singleplayer.
+
 ## Troubleshooting
 
 Create an empty file named `log.txt` next to `conviction_game.exe` — the DLL will write a debug log there on next launch. If the game crashes, a `crash.dmp` file will also be created in the same folder.
